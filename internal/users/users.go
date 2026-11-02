@@ -59,6 +59,11 @@ func Route(app *zip.Group, db orm.DB) {
 	app.Get("/v1/iam/users/:owner/:name", a.Get, zip.WithTags("users"))
 	app.Put("/v1/iam/users/:owner/:name", a.Update, zip.WithTags("users"))
 	app.Delete("/v1/iam/users/:owner/:name", a.Delete, zip.WithTags("users"))
+	// Suspend and reactivate an account without deleting it: flipping IsForbidden
+	// blocks every new grant (sign-in, token mint, keys, federation) at once,
+	// while the row — and its audit, consent and membership history — stays.
+	app.Post("/v1/iam/users/:owner/:name/forbid", a.Forbid, zip.WithTags("users"))
+	app.Post("/v1/iam/users/:owner/:name/re-enable", a.Reenable, zip.WithTags("users"))
 }
 
 // Ref identifies one user by its natural key.
@@ -230,6 +235,13 @@ type ListOutput struct {
 // DeleteOutput reports the outcome of a delete.
 type DeleteOutput struct {
 	Deleted bool `json:"deleted"`
+}
+
+// ForbidInput addresses one account by its natural key, carried in the URL:
+// POST /v1/iam/users/:owner/:name/forbid and POST /v1/iam/users/:owner/:name/re-enable.
+type ForbidInput struct {
+	Owner string `json:"-" url:"owner"`
+	Name  string `json:"-" url:"name"`
 }
 
 // Create adds a person to your organization. Send a password and it becomes the
@@ -627,6 +639,85 @@ func (a *API) Delete(ctx context.Context, in *Ref) (*DeleteOutput, error) {
 		return nil, zip.ErrInternal(err.Error())
 	}
 	return &DeleteOutput{Deleted: true}, nil
+}
+
+// Forbid suspends an account: it flips IsForbidden so every new grant (sign-in,
+// token mint, API keys, federation) is refused at once, while the row and its
+// history stay intact. Re-enable is the inverse.
+//
+// A SuperAdmin may suspend or reactivate any account. An org admin may do it to
+// a member of its own org. The admin organization's accounts are SuperAdmin-only,
+// and a plain member may not suspend anyone — not even themself (use the password
+// change or the account-delete surface instead). The change is audited.
+func (a *API) Forbid(ctx context.Context, in *ForbidInput) (*schema.User, error) {
+	return a.forbid(ctx, in.Owner, in.Name, true)
+}
+
+func (a *API) Reenable(ctx context.Context, in *ForbidInput) (*schema.User, error) {
+	return a.forbid(ctx, in.Owner, in.Name, false)
+}
+
+func (a *API) forbid(ctx context.Context, owner, name string, forbid bool) (*schema.User, error) {
+	if owner == "" || name == "" {
+		return nil, zip.ErrBadRequest("owner and name are required")
+	}
+	existing, err := a.lookup(ctx, owner, name)
+	if err != nil {
+		return nil, zip.ErrInternal(err.Error())
+	}
+	if existing == nil {
+		return nil, zip.ErrNotFound("user " + owner + "/" + name + " not found")
+	}
+	if err := authorizeForbid(ctx, existing.Owner); err != nil {
+		return nil, err
+	}
+	if existing.IsForbidden == forbid {
+		return existing.Mask(), nil // idempotent: already in the requested state
+	}
+	existing.IsForbidden = forbid
+	existing.UpdatedTime = nowRFC3339()
+	existing.Init(a.db)
+	existing.SetKey(existing.Key())
+	if err := existing.Update(); err != nil {
+		return nil, zip.ErrInternal(err.Error())
+	}
+	verb := "forbid"
+	if !forbid {
+		verb = "re-enable"
+	}
+	store.Record(ctx, a.db, &schema.AuditLog{
+		Owner:        owner,
+		Organization: owner,
+		User:         owner + "/" + name,
+		Action:       schema.ActionForbidUser,
+		Method:       "POST",
+		StatusCode:   200,
+		Object:       verb,
+	})
+	return existing.Mask(), nil
+}
+
+// authorizeForbid decides who may suspend or reactivate an account.
+//
+// A SuperAdmin may act on any account. An org admin may act on a member of its
+// own org. The admin organization's accounts are SuperAdmin-only: platform
+// authority is written only by platform authority. A plain member may not
+// suspend anyone, not even themself.
+func authorizeForbid(ctx context.Context, owner string) error {
+	p, ok := principal.From(ctx)
+	if !ok {
+		return zip.ErrForbidden("no principal")
+	}
+	if p.Sudo && p.App == nil {
+		return nil
+	}
+	if owner == policy.AdminOrg {
+		return zip.ErrForbidden("only a SuperAdmin may suspend an account in the admin organization")
+	}
+	if p.AdminOf(owner) {
+		return nil
+	}
+	return zip.ErrForbidden("only a SuperAdmin or this organization's admin may suspend an account")
 }
 
 // Authorize refuses a write to an account in the admin org unless the caller is
