@@ -117,16 +117,16 @@ func idpKind(p *schema.Provider) string {
 // idpAuthorizeURL builds the IdP authorization-endpoint URL the browser is sent
 // to at the begin leg — dialect-dispatched, with iam's callback as the IdP
 // redirect_uri, our single-use state, IdP-leg PKCE, and (OIDC) the nonce.
-func idpAuthorizeURL(ctx context.Context, p *schema.Provider, st *schema.FederationState, callback string) (string, error) {
+func idpAuthorizeURL(ctx context.Context, p *schema.Provider, st *schema.FederationState, callback, loginHint string) (string, error) {
 	switch idpKind(p) {
 	case "oidc":
 		cfg, err := oidcResolve(ctx, p)
 		if err != nil {
 			return "", err
 		}
-		return oidcAuthorizeURL(cfg, p, st, callback), nil
+		return oidcAuthorizeURL(cfg, p, st, callback, loginHint), nil
 	case "github":
-		return githubAuthorizeURL(p, st, callback), nil
+		return githubAuthorizeURL(p, st, callback, loginHint), nil
 	case "apple":
 		return appleAuthorizeURL(p, st, callback), nil
 	default:
@@ -226,7 +226,7 @@ func oidcDiscover(ctx context.Context, issuer string) (oidcDiscoveryDocument, er
 // oidcAuthorizeURL builds the OIDC authorization request: response_type=code,
 // the app-or-default scope, our callback, the single-use state, S256 PKCE, and
 // the nonce that the returned id_token must echo.
-func oidcAuthorizeURL(cfg oidcConfig, p *schema.Provider, st *schema.FederationState, callback string) string {
+func oidcAuthorizeURL(cfg oidcConfig, p *schema.Provider, st *schema.FederationState, callback, loginHint string) string {
 	v := url.Values{}
 	v.Set("response_type", "code")
 	v.Set("client_id", p.ClientId)
@@ -239,7 +239,91 @@ func oidcAuthorizeURL(cfg oidcConfig, p *schema.Provider, st *schema.FederationS
 	v.Set("nonce", st.IdpNonce)
 	v.Set("code_challenge", pkce.Challenge(st.IdpVerifier))
 	v.Set("code_challenge_method", "S256")
+	if strings.TrimSpace(loginHint) != "" {
+		v.Set("login_hint", strings.TrimSpace(loginHint))
+	}
 	return joinQuery(cfg.authURL, v)
+}
+
+// Why a directly-presented id_token (Google One-Tap) was not taken. Each is a
+// fall-through to the IdP's own sign-in, so each is named in the log by directReason.
+var (
+	errDirectToken   = errors.New("federation: direct id_token verification failed")
+	errDirectNonce   = errors.New("federation: direct id_token nonce mismatch")
+	errDirectStale   = errors.New("federation: direct id_token is not fresh")
+	errDirectSubject = errors.New("federation: direct id_token has no subject")
+)
+
+// directReason names why a direct id_token was rejected, in a word a log line can
+// carry. It never includes the token or a claim.
+func directReason(err error) string {
+	switch {
+	case errors.Is(err, errDirectNonce):
+		return "nonce-mismatch"
+	case errors.Is(err, errDirectStale):
+		return "stale-or-future-iat"
+	case errors.Is(err, errDirectSubject):
+		return "no-subject"
+	case errors.Is(err, jwt.ErrTokenExpired):
+		return "expired"
+	case errors.Is(err, jwt.ErrTokenInvalidAudience):
+		return "audience"
+	case errors.Is(err, jwt.ErrTokenInvalidIssuer):
+		return "issuer"
+	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
+		return "signature"
+	case errors.Is(err, jwt.ErrTokenUnverifiable):
+		return "unverifiable-key"
+	case errors.Is(err, jwt.ErrTokenMalformed):
+		return "malformed"
+	case errors.Is(err, jwt.ErrTokenNotValidYet):
+		return "not-valid-yet"
+	case errors.Is(err, jwt.ErrTokenRequiredClaimMissing):
+		return "missing-claim"
+	case errors.Is(err, errDirectToken):
+		return "invalid"
+	default:
+		return "provider-unreachable"
+	}
+}
+
+// oidcVerifyDirectIDToken verifies a directly-presented IdP id_token (e.g. from
+// Google One-Tap) against the provider's discovered JWKS, issuer, client_id
+// audience, expiry, and freshness.
+func oidcVerifyDirectIDToken(ctx context.Context, p *schema.Provider, idToken, nonce string, now time.Time) (federatedIdentity, error) {
+	cfg, err := oidcResolve(ctx, p)
+	if err != nil {
+		return federatedIdentity{}, err
+	}
+	var claims idTokenClaims
+	tok, err := jwt.ParseWithClaims(idToken, &claims, jwksKeyfunc(ctx, cfg.jwksURL),
+		jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}),
+		jwt.WithIssuer(cfg.issuer),
+		jwt.WithAudience(p.ClientId),
+		jwt.WithExpirationRequired(),
+		jwt.WithTimeFunc(func() time.Time { return now }),
+	)
+	if err != nil || !tok.Valid {
+		return federatedIdentity{}, fmt.Errorf("%w: %w", errDirectToken, err)
+	}
+	if nonce != "" || claims.Nonce != "" {
+		if subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(nonce)) != 1 {
+			return federatedIdentity{}, errDirectNonce
+		}
+	}
+	if claims.IssuedAt == nil || now.Sub(claims.IssuedAt.Time) > 5*time.Minute || claims.IssuedAt.Time.Sub(now) > time.Minute {
+		return federatedIdentity{}, errDirectStale
+	}
+	if strings.TrimSpace(claims.Subject) == "" {
+		return federatedIdentity{}, errDirectSubject
+	}
+	return federatedIdentity{
+		subject:       claims.Subject,
+		email:         store.NormalizeEmail(claims.Email),
+		emailVerified: truthy(claims.EmailVerified),
+		displayName:   claims.Name,
+		avatar:        claims.Picture,
+	}, nil
 }
 
 // oidcTokenResponse is the token-endpoint response the OIDC exchange reads.
@@ -329,13 +413,16 @@ func verifyIDToken(ctx context.Context, idToken, jwksURL, issuer, audience, nonc
 // Apps support neither PKCE nor a nonce, so the single-use, browser-bound state
 // carries the CSRF defense; PKCE is added only when the provider opts in
 // (EnablePkce) for a compatible deployment.
-func githubAuthorizeURL(p *schema.Provider, st *schema.FederationState, callback string) string {
+func githubAuthorizeURL(p *schema.Provider, st *schema.FederationState, callback, loginHint string) string {
 	v := url.Values{}
 	v.Set("client_id", p.ClientId)
 	v.Set("redirect_uri", callback)
 	v.Set("scope", providerScopes(p, "read:user user:email"))
 	v.Set("state", st.Name)
 	v.Set("allow_signup", "true")
+	if strings.TrimSpace(loginHint) != "" {
+		v.Set("login", strings.TrimSpace(loginHint))
+	}
 	if p.EnablePkce {
 		v.Set("code_challenge", pkce.Challenge(st.IdpVerifier))
 		v.Set("code_challenge_method", "S256")

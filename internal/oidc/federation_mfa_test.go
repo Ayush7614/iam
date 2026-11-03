@@ -30,11 +30,6 @@ import (
 func fedEnroll(t *testing.T, db orm.DB, name, email string) string {
 	t.Helper()
 	seedUser(t, db, name, email, "pw")
-	// The callback reaches this account by its ADDRESS, and an address is only
-	// linkable once it has been proven — otherwise federation refuses rather than
-	// adopt a row an unproven password already opens. These tests are about the MFA
-	// gate, so they state the premise instead of relying on it.
-	proveEmail(t, db, name)
 	secret, _, err := factor.Enroll("hanzo/"+name, "Hanzo")
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +73,26 @@ func TestFederationMfa_EnrolledUserChallengedThenResumes(t *testing.T) {
 	if n := tokens(t, db); n != 0 {
 		t.Fatalf("%d token row(s) persisted before the second factor", n)
 	}
+	// The account's address resolved the sign-in, and the link waits on the factor.
+	if u := userRow(t, db, "alice"); u.Google != "" || u.EmailVerified {
+		t.Fatalf("the link was written before the second factor: %+v", u)
+	}
 	id := challengeOf(t, resp)
+
+	// A wrong factor uses the challenge up and writes nothing.
+	bad := jsonReq("POST", PathFederationMfa, map[string]string{"mfaType": factor.App, "passcode": "not-a-code"})
+	bad.Header.Set("Cookie", challengeCookie+"="+id)
+	if _, body := do(t, app, bad); decode(t, body)["status"] == "ok" {
+		t.Fatal("a wrong factor resumed the sign-in")
+	}
+	if u := userRow(t, db, "alice"); u.Google != "" || u.EmailVerified {
+		t.Fatalf("a wrong factor wrote the link: %+v", u)
+	}
+	q, cookie = beginAuthorize(t, app, "webapp", fedProvGoogle)
+	m.mu.Lock()
+	m.nonce = q.Get("nonce")
+	m.mu.Unlock()
+	id = challengeOf(t, callback(t, app, q.Get("state"), "idp-code-2", cookie))
 
 	// Present the factor → the code is minted and the RP redirect returned.
 	req := jsonReq("POST", PathFederationMfa, map[string]string{"mfaType": factor.App, "passcode": passcode(t, secret)})
@@ -106,6 +120,9 @@ func TestFederationMfa_EnrolledUserChallengedThenResumes(t *testing.T) {
 	}
 	if tok.User != "hanzo/alice" {
 		t.Fatalf("code bound to %q, want hanzo/alice", tok.User)
+	}
+	if u := userRow(t, db, "alice"); u.Google != m.sub || !u.EmailVerified {
+		t.Fatalf("the link was not written once the factor passed: %+v", u)
 	}
 }
 
@@ -151,7 +168,6 @@ func TestFederationMfa_UnenrolledUserFlowsThrough(t *testing.T) {
 	app, db := newServer(t)
 	seedApp(t, db, appOpts{clientID: "webapp", redirectURIs: []string{testRedirect}})
 	seedUser(t, db, "bob", "alice@example.com", "pw") // matches the mock email, NO factor
-	proveEmail(t, db, "bob")                          // linkable by address; see fedEnroll
 	m := newMockOIDC(t, fedGoogleCID)
 	seedOIDCProvider(t, db, "webapp", m)
 
@@ -278,7 +294,6 @@ func TestFederationMfa_DeliveredFactorResumes(t *testing.T) {
 	bindSender(t, f)
 	seedApp(t, db, appOpts{clientID: "webapp", redirectURIs: []string{testRedirect}})
 	seedUser(t, db, "alice", "alice@example.com", "pw")
-	proveEmail(t, db, "alice") // linkable by address; see fedEnroll
 
 	// An EMAIL factor and nothing else — no authenticator on the row.
 	u := userRow(t, db, "alice")
