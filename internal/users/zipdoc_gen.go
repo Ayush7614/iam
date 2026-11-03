@@ -8,7 +8,7 @@ import (
 
 func init() {
 	zip.Describe("github.com/hanzoai/iam/internal/users DELETE /v1/iam/users/:owner/:name", zip.Doc{
-		Description: "Removes a person from your organization. Their sessions stop working\nimmediately and the account is gone rather than suspended — to keep the record\nand only stop sign-in, update the user instead.\n\nA SuperAdmin's account is removed only by a SuperAdmin.",
+		Description: "Removes a person from your organization. Their sessions stop working\nimmediately and the account is gone rather than suspended — to keep the record\nand only stop sign-in, use Forbid instead.\n\nA SuperAdmin's account is removed only by a SuperAdmin.",
 	})
 	zip.Describe("github.com/hanzoai/iam/internal/users GET /v1/iam/users", zip.Doc{
 		Description: "Returns a page of the people in an organization, with the total so you\ncan page through the rest. Passwords, API secrets and MFA material are stripped\nfrom every entry.\n\nWhich organization comes from your credentials, not from the request: you read\nyour own and no one else's, and a credential whose scope spans tenants reads\nthe tenant it names — or, naming none, every one of them.",
@@ -66,7 +66,7 @@ func init() {
 		},
 	})
 	zip.Describe("github.com/hanzoai/iam/internal/users POST /v1/iam/users/:owner/:name/forbid", zip.Doc{
-		Description: "Suspends an account: it flips IsForbidden so every new grant (sign-in,\ntoken mint, API keys, federation) is refused at once, while the row and its\nhistory stay intact. Re-enable is the inverse.\n\nA SuperAdmin may suspend or reactivate any account. An org admin may do it to\na member of its own org. The admin organization's accounts are SuperAdmin-only,\nand a plain member may not suspend anyone — not even themself (use the password\nchange or the account-delete surface instead). The change is audited.",
+		Description: "Suspends an account — POST /v1/iam/users/:owner/:name/forbid. It flips\nIsForbidden so every new grant (sign-in, token mint, API keys, federation) is\nrefused at once, while the row and its history stay intact. Reenable is the\ninverse.\n\nA SuperAdmin may suspend or reactivate any account. An org admin may do it to\na member of its own org. The admin organization's accounts are SuperAdmin-only,\nand a plain member may not suspend anyone — not even themself (use the password\nchange or the account-delete surface instead).\n\nThe call is idempotent — asking for the state the account already holds\nsucceeds and reports it — and every invocation, changed or not, is written to\nthe audit trail under ActionForbidUser with the actor, the target and the\nanswer. A refused invocation is recorded too: the attempt is what an auditor\nneeds to see.",
 		Fields: map[string]string{
 			"Model[github.com/hanzoai/iam/pkg/schema.User].id": "Persisted fields",
 			"User.accessKey":           "API credentials. AccessSecret / AccessSecretHash / the OAuth tokens are\nbearer material, so Mask blanks them and the handler's redact() strips them\nbefore responding. They carry real json tags because a field orm never saves\nis a field that silently vanishes.\n\nA presented secret is resolved through Key.AccessSecretDigest and nowhere\nelse, so no credential is ISSUED into these columns: they hold what older\nrows left behind, and every writer that touches them clears them.",
@@ -84,6 +84,7 @@ func init() {
 		},
 	})
 	zip.Describe("github.com/hanzoai/iam/internal/users POST /v1/iam/users/:owner/:name/re-enable", zip.Doc{
+		Description: "Reactivates an account — POST /v1/iam/users/:owner/:name/re-enable.\nIt clears IsForbidden, the inverse of Forbid, so the account may sign in and\nbe issued credentials again. The same authority rules apply, and the act is\naudited under ActionForbidUser like the suspension it reverses.",
 		Fields: map[string]string{
 			"Model[github.com/hanzoai/iam/pkg/schema.User].id": "Persisted fields",
 			"User.accessKey":           "API credentials. AccessSecret / AccessSecretHash / the OAuth tokens are\nbearer material, so Mask blanks them and the handler's redact() strips them\nbefore responding. They carry real json tags because a field orm never saves\nis a field that silently vanishes.\n\nA presented secret is resolved through Key.AccessSecretDigest and nowhere\nelse, so no credential is ISSUED into these columns: they hold what older\nrows left behind, and every writer that touches them clears them.",
@@ -101,7 +102,7 @@ func init() {
 		},
 	})
 	zip.Describe("github.com/hanzoai/iam/internal/users PUT /v1/iam/users/:owner/:name", zip.Doc{
-		Description: "Changes a person's profile, their roles, or the credentials they sign\nin with. Send a password to reset it; leave it out and their current one keeps\nworking.\n\nWho they are does not change: their organization, username and the identifier\ntheir existing sessions are keyed on all survive the write, so an update never\nsigns anyone out.\n\nA SuperAdmin's account is changed only by a SuperAdmin.",
+		Description: "Changes a person's profile, their roles, or the credentials they sign\nin with. Send a password to reset it; leave it out and their current one keeps\nworking.\n\nWho they are does not change: their organization, username and the identifier\ntheir existing sessions are keyed on all survive the write, so an update never\nsigns anyone out. Nor does whether they are suspended: that is server-owned\nstate with its own audited verbs (Forbid/Reenable), and a profile write carries\nthe stored value rather than accepting one from the body.\n\nA SuperAdmin's account is changed only by a SuperAdmin.",
 		Fields: map[string]string{
 			"Model[github.com/hanzoai/iam/pkg/schema.User].id": "Persisted fields",
 			"User.accessKey":           "API credentials. AccessSecret / AccessSecretHash / the OAuth tokens are\nbearer material, so Mask blanks them and the handler's redact() strips them\nbefore responding. They carry real json tags because a field orm never saves\nis a field that silently vanishes.\n\nA presented secret is resolved through Key.AccessSecretDigest and nowhere\nelse, so no credential is ISSUED into these columns: they hold what older\nrows left behind, and every writer that touches them clears them.",
