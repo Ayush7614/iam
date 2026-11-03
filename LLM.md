@@ -234,7 +234,44 @@ credential act that is only safe once the NEW address has proved it can receive
 one — and **`properties`**, because the consent record nests inside it
 (`PreferencesKey`), so a profile write reaching it would let anyone answer the
 data-sharing questions on their own behalf. `avatar` is `schema.AvatarRef`: one
-rule for how a subject appears, person or organization.
+rule for how a subject appears, person or organization. An address is added by
+`PUT /v1/iam/address`, below.
+
+## `PUT /v1/iam/address` — a sign-in address, added once a code proved it
+
+`{clientId, address, code}` → `{owner, name, email, phone}`. How an account that
+began with no address (a wallet, an agent's headless signup at a founding app) is
+later signed in to as the SAME account by email or text. Code: `internal/oidc/address.go`;
+tests `TestAddress*`, wallet end to end `TestWalletAccountAddsAPhoneAndSignsInByIt`.
+
+- The caller is `callerFrom` (cookie or bearer, never one someone acts through);
+  a machine is 403. The application must sign them in: they live in its org or it
+  registered them (`store.RegisteredIn`), else 403.
+- The proof is the code `POST /v1/iam/verification-codes` filed for NOBODY under the
+  app's org (`applicationId admin/<app>`), spent by `otp.Prove`.
+- It ADDS, never replaces: the same value again is ok with no code; a different
+  one is 409. Replacing a login address is a separate owner decision.
+- An address any OTHER account would be resolved by at that app
+  (`resolveLoginUser`, ambiguity included) is refused BEFORE the code is read,
+  with the wrong-code words, so no caller learns who holds an address.
+- Email lands normalized and `EmailVerified`; a phone `store.NormalizePhone`d.
+  `schema.ActionAddress` (PlatformWritten) is written in the same transaction,
+  object `{client, field}`, never the address or the code.
+- `GET /v1/iam/auth/methods` says `address: true` exactly when a sender is bound
+  (`otp.DeliveryConfigured`), because the add is proved by a code: a screen draws
+  the form only where it can finish, and `@hanzo/iam` 0.21.37 reads it as
+  `methods().address`. `code` says a code can be sent, by either channel; whether
+  the org's notify holds a text credential is notify's fact (KMS
+  `orgs/<org>/notify/twilio/{account-sid,auth-token,from-number}`), not IAM's.
+- CORS: `[bearer]`, and the preflight now advertises PUT for every browser path.
+
+**The phone reach.** A founded account works in an org of its own, so the app's
+org held its number nowhere: a texted code was filed for nobody. `store.GetSignupByPhone`
+is `GetSignupByEmail` for numbers; the SMS send falls back to it after the in-org
+lookup (two registrations on one number: refused, nothing minted), and
+`resolveLoginUser` asks it for a phone-shaped identifier after the in-org and name
+reaches miss, so code sign-in and a code reset find the account.
+`/v1/iam/auth/identifier` still takes email only.
 
 ## `lastSigninTime` had no writer, which is worse than having no column
 
@@ -1089,6 +1126,23 @@ account → Security) POSTs same-origin with the session cookie plus a hanzo-con
 bearer and navigates to the answer. `@hanzo/iam`, hanzo.ai and `@hanzo/rooms` do
 not call it. Pinned by `TestLink_*`.
 
+A social SIGN-IN resolves its account in `linkOrProvision` (`internal/oidc/federation.go`):
+the provider subject, else the one account holding the address, else a new account.
+An existing account is opened only when the provider vouches for it (`vouches`): a
+provider filed under a reserved org (every production provider is `admin/provider-*`)
+may open any account outside a reserved org; a tenant's provider only accounts of its
+own org, never a held org's. The address links when the provider verified it, however
+the account was made and whatever its own `EmailVerified`; the link sets the subject
+and `EmailVerified` and nothing else (password, sessions, other methods, org, roles
+stay). It is resolved, not written: `federationMint` writes it after the account
+state and second-factor gates, re-checking the row under its lock, with the
+`schema.ActionFederationLink` audit row appended first. Refused (`errAddressHeld`): an
+address the provider did not verify, an account the provider does not vouch for, an
+account holding another subject of that provider. Two accounts on one address, in
+either reach or across both, is `store.ErrEmailAmbiguous`. The lookups never read a
+reserved org, so an `admin` account is never linked this way. Pinned by
+`TestFederation_Links*`, `federation_trust_test.go`.
+
 ## A wallet is a sign-in method, and the account's DID is derived from `sub`
 
 A person links a wallet once, here, and every app reads it as a claim. Three
@@ -1112,8 +1166,17 @@ read from the SIGNED MESSAGE (never the body, or a forged body could desync the
 two), the challenge is BURNED atomically before any cryptography (so a captured
 proof cannot be replayed even when its signature is perfect), the burned row's
 `domain` and `chain` are re-checked, and only then is the signature verified.
-The domain is `c.Host()` at both ends — the true routed brand host, never
-`X-Forwarded-Host` — because the whole anti-phishing binding rides on it.
+The domain is `site()` at both ends: the asking page's origin when the nonce
+names a `clientId` whose redirect URIs register that origin (`oidc.Landing`, the
+one rule the emailed link uses), else `c.Host()` — the true routed brand host,
+never `X-Forwarded-Host` — because the whole anti-phishing binding rides on it.
+So hanzo.ai asking IAM at api.hanzo.ai gets a challenge for `hanzo.ai`, and the
+wallet's own domain check passes. Verify accepts the burned row's domain when it
+equals either the request's site or its Host (a same-origin GET carries no
+Origin), and `VerifyProof` always expects the burned row's. A forged Origin can
+only pick among the app's own origins. Every mint sweeps expired challenges, at
+most `batch` rows once per `ttl` per process (`sweep`); the nonce `address` is
+bounded by `maxAddress` on both legs.
 Identity is the address the VERIFIER recovered, canonicalized (EVM lowercased;
 base58/bech32/SS58 trimmed only, because they are case-sensitive), never the one
 the client claimed.
@@ -1124,6 +1187,20 @@ authority, so a cross-site caller is treated as anonymous — a forged POST must
 not attach an attacker's wallet to a signed-in victim. `(chain, address)` is
 globally unique, checked in the same transaction as the bind, so one wallet is
 one identity and a wallet already spoken for is refused rather than moved.
+
+**Creating an account is capped** (`internal/wallet/cap.go`). A wallet is a free
+key, so one script could mint accounts without end. `Cap` bounds the accounts
+sign-up CREATES per client address and per network (IPv4 /24, IPv6 /64) in a
+window: default 10 and 50 per 24h, set by `IAM_WALLET_CAP_IP`,
+`IAM_WALLET_CAP_SUBNET` (`0` = off) and `IAM_WALLET_CAP_WINDOW` (Go duration);
+an unreadable value keeps the default. A wallet on file and a link to a held
+account are never counted. The client is `httpx.Client`, the one rule IAM
+counts by (CF-Connecting-IP, else the last X-Forwarded-For hop; the identifier
+throttle reads it too). The ledger is `schema.ActionWalletSignup` audit rows
+(ClientIp = address, Object = network), counted and written in the account's
+transaction, so a refusal writes nothing and concurrent creations cannot share
+one count. Refusal: 429, `Retry-After`, code `wallet_signup_capped`, data
+`{cap: "ip"|"subnet", limit, window, retryAfter}` (seconds).
 
 **Unlinking** is `POST /v1/iam/unlink` with
 `{"providerType":"wallet","chain":…,"address":…,"user":{"owner":…,"name":…}}` —

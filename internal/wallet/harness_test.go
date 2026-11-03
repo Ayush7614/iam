@@ -117,6 +117,9 @@ type opts struct {
 	orgChoice string
 	// shared is the application's IsShared: it serves many orgs.
 	shared bool
+	// redirects is the application's RedirectUris, whose origins are the pages
+	// a challenge may name (site).
+	redirects []string
 }
 
 // seed creates the organization and application a wallet login routes through.
@@ -146,6 +149,7 @@ func seed(t *testing.T, db orm.DB, o opts) *schema.Application {
 	a.EnableSignUp = o.signup
 	a.OrgChoiceMode = o.orgChoice
 	a.IsShared = o.shared
+	a.RedirectUris = o.redirects
 	a.SetId("admin/" + o.name)
 	if err := a.CreateCtx(tctx()); err != nil {
 		t.Fatalf("seed app: %v", err)
@@ -225,7 +229,14 @@ func mintFor(t *testing.T, app *zip.App, chain string) wc.LoginChallenge {
 // spoofed X-Forwarded-Host and assert the challenge still binds to the true host.
 func mintWith(t *testing.T, app *zip.App, chain string, hdr map[string]string) wc.LoginChallenge {
 	t.Helper()
-	_, m := getWith(t, app, PathNonce+"?chain="+chain+"&address="+addr, hdr)
+	return mintAt(t, app, "chain="+chain+"&address="+addr, hdr)
+}
+
+// mintAt drives GET /v1/iam/web3/nonce with the query and headers given, so a
+// test can name a clientId and the Origin of the page asking.
+func mintAt(t *testing.T, app *zip.App, query string, hdr map[string]string) wc.LoginChallenge {
+	t.Helper()
+	_, m := getWith(t, app, PathNonce+"?"+query, hdr)
 	if m["status"] != "ok" {
 		t.Fatalf("nonce: %v", m)
 	}
@@ -334,9 +345,9 @@ func challenges(t *testing.T, db orm.DB) []*schema.Challenge {
 
 // --- a real bearer, for the one branch that honors a session ---
 
-// bearer seeds a signing cert + a user, and returns a token the authz Guard's
-// verifier accepts for that user.
-func bearer(t *testing.T, db orm.DB, a *schema.Application, org, name string) (*schema.User, string) {
+// seedCert seeds the platform signing cert — what signs a token and keys a
+// session — and returns its key.
+func seedCert(t *testing.T, db orm.DB) *rsa.PrivateKey {
 	t.Helper()
 	k, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -352,6 +363,14 @@ func bearer(t *testing.T, db orm.DB, a *schema.Application, org, name string) (*
 	if err := c.CreateCtx(tctx()); err != nil {
 		t.Fatalf("seed cert: %v", err)
 	}
+	return k
+}
+
+// bearer seeds a signing cert + a user, and returns a token the authz Guard's
+// verifier accepts for that user.
+func bearer(t *testing.T, db orm.DB, a *schema.Application, org, name string) (*schema.User, string) {
+	t.Helper()
+	k := seedCert(t, db)
 
 	u := orm.New[schema.User](db)
 	u.Owner = org

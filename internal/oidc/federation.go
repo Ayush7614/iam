@@ -182,13 +182,31 @@ func beginFederation(c *zip.Ctx, db orm.DB, app *schema.Application, q authorize
 		ExpireIn:            now.Add(fedStateTTL).Unix(),
 	}
 
+	// If the relying party already obtained a fresh signed id_token from the IdP
+	// (e.g. Google One-Tap), verify it directly against the provider's JWKS and
+	// complete the sign-in without a redundant browser hop to the IdP login page.
+	if idTokenHint := param(c, "id_token_hint"); idTokenHint != "" && idpKind(prov) == "oidc" {
+		switch {
+		case !topLevelNavigation(c):
+			log.Printf("federation: direct id_token not used: provider=%s client=%s reason=not-a-navigation dest=%s", prov.Name, q.clientID, c.Header("Sec-Fetch-Dest"))
+		default:
+			identity, err := oidcVerifyDirectIDToken(ctx, prov, idTokenHint, param(c, "idp_nonce"), now)
+			if err == nil {
+				return completeFederationSignIn(c, db, app, prov, st, identity, now)
+			}
+			// The person is sent on to the IdP, who asks them to choose an account:
+			// the reason is the only record that it was not asked for. Never the token.
+			log.Printf("federation: direct id_token rejected: provider=%s client=%s reason=%s", prov.Name, q.clientID, directReason(err))
+		}
+	}
+
 	// Build the IdP authorize URL BEFORE persisting so a discovery/config failure
 	// never leaves an orphaned transaction row.
 	callback, err := federationCallbackURL(c)
 	if err != nil {
 		return authorizeErrorRedirect(c, q, "server_error", "")
 	}
-	idpURL, err := idpAuthorizeURL(ctx, prov, st, callback)
+	idpURL, err := idpAuthorizeURL(ctx, prov, st, callback, q.loginHint)
 	if err != nil {
 		return authorizeErrorRedirect(c, q, "temporarily_unavailable", "the identity provider is unavailable")
 	}
@@ -341,52 +359,58 @@ func federationCallbackHandler(db orm.DB) zip.Handler {
 			return fedAttachRedirect(c, db, st, prov, identity)
 		}
 
-		user, err := linkOrProvision(ctx, db, app, prov, identity)
-		if err != nil {
-			return fedResolveErrorRedirect(c, st, err)
-		}
-		if user.IsForbidden || user.IsDeleted {
-			return fedErrorRedirect(c, st, "access_denied", "the account is not permitted")
-		}
-
-		// The resume parameters — the ORIGINAL authorize request — pinned so the mint
-		// (now, or after a second factor) uses exactly these and nothing a later
-		// request could supply.
-		p := fedResumeParams{
-			ClientId:            st.ClientId,
-			RedirectUri:         st.RedirectUri,
-			AppState:            st.AppState,
-			Scope:               st.Scope,
-			AppNonce:            st.AppNonce,
-			CodeChallenge:       st.CodeChallenge,
-			CodeChallengeMethod: st.CodeChallengeMethod,
-			Resource:            st.Resource,
-		}
-
-		// Second-factor gate: a federated login must NOT skip the factor a password
-		// login would demand (the MFA gate, mfa_gate.go). If the resolved user owes a
-		// factor, mint NOTHING here — park the resume, bound to the user and these
-		// pinned params, and send the browser to the hosted 2FA page.
-		org, err := store.GetOrganizationByName(ctx, db, user.Owner)
-		if err != nil {
-			return fedFault(c, st, "organization "+user.Owner+" of "+user.Owner+"/"+user.Name, err)
-		}
-		if factor.Prompt(org, user) {
-			// The organization requires a factor this federated user has not enrolled;
-			// a federated login cannot enroll one inline, so it fails closed.
-			return fedErrorRedirect(c, st, "access_denied", "two-factor authentication must be set up before signing in")
-		}
-		if factor.Enabled(user) && !remembered(c, user, now) {
-			return federationChallenge(c, db, st, user, p, org, now)
-		}
-
-		// No second factor owed — complete exactly as before, through the one mint.
-		loc, err := federationMint(c, db, app, user, p, now)
-		if err != nil {
-			return fedMintErrorRedirect(c, st, err)
-		}
-		return c.Redirect(302, loc)
+		return completeFederationSignIn(c, db, app, prov, st, identity, now)
 	}
+}
+
+func completeFederationSignIn(c *zip.Ctx, db orm.DB, app *schema.Application, prov *schema.Provider, st *schema.FederationState, identity federatedIdentity, now time.Time) error {
+	ctx := c.Context()
+	user, link, err := linkOrProvision(ctx, db, app, prov, identity)
+	if err != nil {
+		return fedResolveErrorRedirect(c, st, err)
+	}
+	if user.IsForbidden || user.IsDeleted {
+		return fedErrorRedirect(c, st, "access_denied", "the account is not permitted")
+	}
+
+	// The resume parameters — the ORIGINAL authorize request — pinned so the mint
+	// (now, or after a second factor) uses exactly these and nothing a later
+	// request could supply.
+	p := fedResumeParams{
+		ClientId:            st.ClientId,
+		RedirectUri:         st.RedirectUri,
+		AppState:            st.AppState,
+		Scope:               st.Scope,
+		AppNonce:            st.AppNonce,
+		CodeChallenge:       st.CodeChallenge,
+		CodeChallengeMethod: st.CodeChallengeMethod,
+		Resource:            st.Resource,
+		Link:                link,
+	}
+
+	// Second-factor gate: a federated login must NOT skip the factor a password
+	// login would demand (the MFA gate, mfa_gate.go). If the resolved user owes a
+	// factor, mint NOTHING here — park the resume, bound to the user and these
+	// pinned params, and send the browser to the hosted 2FA page.
+	org, err := store.GetOrganizationByName(ctx, db, user.Owner)
+	if err != nil {
+		return fedFault(c, st, "organization "+user.Owner+" of "+user.Owner+"/"+user.Name, err)
+	}
+	if factor.Prompt(org, user) {
+		// The organization requires a factor this federated user has not enrolled;
+		// a federated login cannot enroll one inline, so it fails closed.
+		return fedErrorRedirect(c, st, "access_denied", "two-factor authentication must be set up before signing in")
+	}
+	if factor.Enabled(user) && !remembered(c, user, now) {
+		return federationChallenge(c, db, st, user, p, org, now)
+	}
+
+	// No second factor owed — complete exactly as before, through the one mint.
+	loc, err := federationMint(c, db, app, user, p, now)
+	if err != nil {
+		return fedMintErrorRedirect(c, st, err)
+	}
+	return c.Redirect(302, loc)
 }
 
 // handoff answers a form_post reply with a 303 to a same-origin GET of the
@@ -471,6 +495,9 @@ type fedResumeParams struct {
 	CodeChallenge       string `json:"codeChallenge"`
 	CodeChallengeMethod string `json:"codeChallengeMethod"`
 	Resource            string `json:"resource"`
+	// Link is the provider identity this sign-in links onto the account by its
+	// verified address, written by federationMint, after every gate has passed.
+	Link *fedLink `json:"link,omitempty"`
 }
 
 // errPKCERequired is the one distinguished mint error a caller maps to an OAuth
@@ -481,13 +508,19 @@ var errPKCERequired = errors.New("federation: PKCE is required for public client
 // password login mints — bound to the pinned app-leg PKCE, redirect_uri and nonce,
 // and returns the RP redirect (redirect_uri?code&state). It is the ONE mint path
 // both the no-factor completion and the post-2FA resume reach, so a federated code
-// can never be minted two different ways.
+// can never be minted two different ways. A link the sign-in resolved (p.Link) is
+// written here, first, so it is written only for a sign-in that completes.
 func federationMint(c *zip.Ctx, db orm.DB, app *schema.Application, user *schema.User, p fedResumeParams, now time.Time) (string, error) {
 	ctx := c.Context()
 	// A public client must have carried a PKCE challenge, re-asserted at the mint so
 	// a minted code is never redeemable without proof.
 	if app.ClientSecret == "" && p.CodeChallenge == "" {
 		return "", errPKCERequired
+	}
+	if p.Link != nil {
+		if err := p.Link.write(ctx, db, user.Owner, user.Name, app.ClientId); err != nil {
+			return "", err
+		}
 	}
 	userID := user.Owner + "/" + user.Name
 	codeRow, err := MintCode(app, userID, p.Scope, p.CodeChallenge, p.CodeChallengeMethod, p.Resource, now)
@@ -542,12 +575,13 @@ func federationChallenge(c *zip.Ctx, db orm.DB, st *schema.FederationState, user
 	return c.Redirect(302, base+PathMfaVerify)
 }
 
-// fedMintErrorRedirect maps a federationMint error to the RP redirect_uri.
+// fedMintErrorRedirect maps a federationMint error to the RP redirect_uri: a link
+// refused at the write is answered as the resolve's own refusal.
 func fedMintErrorRedirect(c *zip.Ctx, st *schema.FederationState, err error) error {
 	if err == errPKCERequired {
 		return fedErrorRedirect(c, st, "invalid_request", "PKCE is required for public clients")
 	}
-	return fedFault(c, st, "code mint", err)
+	return fedResolveErrorRedirect(c, st, err)
 }
 
 // The ways resolving a local identity is REFUSED rather than broken. Each is a
@@ -555,9 +589,8 @@ func fedMintErrorRedirect(c *zip.Ctx, st *schema.FederationState, err error) err
 // answering an opaque server_error tells someone to try again forever. None of
 // them reveals whether an account exists.
 var (
-	// errAddressHeld: the address the IdP asserted already names a local account
-	// this federated identity is not entitled to adopt. Sign in with the password
-	// that account already has.
+	// errAddressHeld: the account this identity resolves to is not one this sign-in
+	// may link or open (linkOrProvision). Sign in with that account's own method.
 	errAddressHeld = errors.New("federation: the address already names an account")
 	// errNoFederatedSignup: this application is not open for registration, and the
 	// identity is new. The same refusal the password and wallet endpoints give.
@@ -567,6 +600,10 @@ var (
 	errNoFederatedEmail = errors.New("federation: the provider shared no email address")
 )
 
+// msgAddressHeld is what a person is told for errAddressHeld, on the callback and
+// on the second-factor resume alike.
+const msgAddressHeld = "an account already uses this email address — sign in with its password"
+
 // fedResolveErrorRedirect maps a linkOrProvision failure to the RP redirect_uri:
 // a named refusal leaves as access_denied with its reason, everything else as an
 // opaque server_error. One mapper, so a new refusal is stated once and the
@@ -574,7 +611,7 @@ var (
 func fedResolveErrorRedirect(c *zip.Ctx, st *schema.FederationState, err error) error {
 	switch {
 	case errors.Is(err, errAddressHeld):
-		return fedErrorRedirect(c, st, "access_denied", "an account already uses this email address — sign in with its password")
+		return fedErrorRedirect(c, st, "access_denied", msgAddressHeld)
 	case errors.Is(err, errNoFederatedSignup):
 		return fedErrorRedirect(c, st, "access_denied", "this application is not open for registration")
 	case errors.Is(err, errNoFederatedEmail):
@@ -619,22 +656,25 @@ func fedAttachRedirect(c *zip.Ctx, db orm.DB, st *schema.FederationState, prov *
 
 // linkOrProvision resolves the local identity for a verified federated login,
 // PROVISION-DON'T-PROMOTE: (1) an account already linked to this provider
-// subject, else (2) the account that already holds this address — linked when both
-// sides proved the address, refused otherwise — else (3) a freshly provisioned
-// account. It NEVER sets isAdmin and never grants an existing account anything —
-// federation only authenticates.
-func linkOrProvision(ctx context.Context, db orm.DB, app *schema.Application, prov *schema.Provider, id federatedIdentity) (*schema.User, error) {
+// subject, else (2) the account that already holds this address — linked when the
+// IdP verified the address, refused otherwise — else (3) a freshly provisioned
+// account. An existing account is opened only when the provider vouches for it
+// (vouches). A link is returned, not written: federationMint writes it once the
+// sign-in completes. It NEVER sets isAdmin and never grants an existing account
+// anything — federation only authenticates.
+func linkOrProvision(ctx context.Context, db orm.DB, app *schema.Application, prov *schema.Provider, id federatedIdentity) (*schema.User, *fedLink, error) {
 	// Innermost guard on the mint itself: never provision/link a federated identity
 	// into a reserved system org (SuperAdmin) or a tenant this app may not serve.
 	// This layer assumes the two before it (app-write authorization + the begin/
 	// callback checks) both failed.
 	if !federationOrgAllowed(app) {
-		return nil, errors.New("federation: provisioning into this organization is not permitted")
+		return nil, nil, errors.New("federation: provisioning into this organization is not permitted")
 	}
 	org := app.Organization
+	owner := providerOwner(prov)
 	binding, ok := connectorFor(prov.Type)
 	if !ok {
-		return nil, errors.New("federation: provider has no local identity binding")
+		return nil, nil, errors.New("federation: provider has no local identity binding")
 	}
 
 	// 1. Already linked by the provider's stable subject — the authoritative match
@@ -644,72 +684,59 @@ func linkOrProvision(ctx context.Context, db orm.DB, app *schema.Application, pr
 	// been founded for each of them: the subject is what says "this is the same
 	// person", and a reach that stops short would answer "new" and hand them another
 	// account.
-	if u, err := store.GetUserByConnector(ctx, db, org, binding.field, id.subject); err != nil {
-		return nil, err
-	} else if u != nil {
-		return u, nil
+	u, err := store.GetUserByConnector(ctx, db, org, binding.field, id.subject)
+	if err == nil && u == nil {
+		u, err = store.GetSignupByConnector(ctx, db, org, binding.field, id.subject)
 	}
-	if u, err := store.GetSignupByConnector(ctx, db, org, binding.field, id.subject); err != nil {
-		return nil, err
-	} else if u != nil {
-		return u, nil
+	if err != nil {
+		return nil, nil, err
+	}
+	if u != nil {
+		if !vouches(owner, u) {
+			return nil, nil, errAddressHeld
+		}
+		return u, nil, nil
 	}
 
 	// 2. An account already holds this address. Resolve that FIRST, whether or not
 	// the IdP vouched for the address, because every answer below turns on it — and
 	// because an ambiguous address (ErrEmailAmbiguous) must refuse here too rather
-	// than be walked past into a third row on the same address.
+	// than be walked past into a third row on the same address. Both reaches are
+	// read — the application's org, and the accounts registered in it, which is
+	// where a founded account lives — and two different accounts between them are
+	// as ambiguous as two in one.
 	if id.email != "" {
 		u, err := store.GetUserByEmail(ctx, db, org, id.email)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		// And among the accounts registered in the application's org — the same reach
-		// as the subject above. Without it an address held by someone founded into an
-		// org of their own reads as free, the branch below never runs, and they are
-		// given a second account on the address they already hold.
-		if u == nil {
-			if u, err = store.GetSignupByEmail(ctx, db, org, id.email); err != nil {
-				return nil, err
-			}
+		signup, err := store.GetSignupByEmail(ctx, db, org, id.email)
+		if err != nil {
+			return nil, nil, err
+		}
+		switch {
+		case u == nil:
+			u = signup
+		case signup != nil && (signup.Owner != u.Owner || signup.Name != u.Name):
+			return nil, nil, store.ErrEmailAmbiguous
 		}
 		if u != nil {
-			// The link requires proof on BOTH sides, and only one side was ever checked.
+			// One address, one person: when the IdP verified the address and the
+			// provider vouches for the account, the account that holds it is the person
+			// signing in, however that account was made — by a password, a code, or
+			// another provider. The link adds this provider's subject and records the
+			// address as verified; the account's password, sessions, other sign-in
+			// methods, org and roles stay as they are.
 			//
-			// The IdP side was: an unverified IdP email never links, "it would let an
-			// unproven address take over an account". The LOCAL side is the side signup
-			// never proves — it writes EmailVerified: false and nothing a password signup
-			// can reach ever sets it — so the sentence was true and half-enforced. An
-			// attacker signed up with a stranger's address and their own passphrase; when
-			// the real owner arrived with a VERIFIED Google identity, this adopted the
-			// attacker's row, flipped EmailVerified to true, and left the digest alone.
-			// Both parties then held the account, silently, for good. 218 live rows are in
-			// that shape today.
-			//
-			// So: link only onto a row that an unproven credential cannot already open —
-			// one whose own address was proven, or one that carries no password at all.
-			// Otherwise refuse, and do NOT fall through to provision: a second row on one
-			// address is the ambiguity the lookup above refuses to resolve.
-			//
-			// Refusing is the whole cure available here. Adopting the row anyway and
-			// clearing its digest would also evict the attacker, but it silently
-			// destroys the credential of every one of those 218 people the first time
-			// they click a social button, and which of the two parties is at the browser
-			// is exactly what this cannot know. The person who has a password signs in
-			// with it; the person who does not was never locked out. Proving the address
-			// AT SIGNUP is what actually drains the pool.
-			if !id.emailVerified || (!u.EmailVerified && u.PasswordHash != "") {
-				return nil, errAddressHeld
+			// Refused instead: an address the IdP did not verify, an account the
+			// provider does not vouch for, and an account that already signs in with
+			// another identity at this provider (as PathLink refuses one). None falls
+			// through to provision: a second row on one address is the ambiguity the
+			// lookup above refuses to resolve.
+			if !id.emailVerified || !vouches(owner, u) || *binding.ref(u) != "" {
+				return nil, nil, errAddressHeld
 			}
-			linked, err := updateUser(ctx, db, u.Owner, u.Name, func(_ orm.DB, fresh *schema.User) error {
-				*binding.ref(fresh) = id.subject
-				fresh.EmailVerified = true
-				return nil
-			})
-			if err != nil {
-				return nil, err
-			}
-			return linked, nil
+			return u, &fedLink{Owner: owner, Type: prov.Type, Provider: prov.Name, Subject: id.subject, Email: store.NormalizeEmail(id.email)}, nil
 		}
 	}
 
@@ -725,7 +752,7 @@ func linkOrProvision(ctx context.Context, db orm.DB, app *schema.Application, pr
 	// keeps, so a shared application does not file a provider's stranger in the
 	// operator's org any more than it files a password's.
 	if !app.EnableSignUp || !Registers(app, app.Organization) {
-		return nil, errNoFederatedSignup
+		return nil, nil, errNoFederatedSignup
 	}
 	// An address is what an account is named after and reached at, so a provider
 	// that shares none is refused rather than turned into a row nobody can use. A
@@ -734,12 +761,72 @@ func linkOrProvision(ctx context.Context, db orm.DB, app *schema.Application, pr
 	// named after the PROVIDER ("github", then "github2") with an empty email, never
 	// matched to the person's real account and with no way back in.
 	if id.email == "" {
-		return nil, errNoFederatedEmail
+		return nil, nil, errNoFederatedEmail
 	}
 	// No row holds this address, which is now a property of reaching this line rather
 	// than something to re-check. Federated accounts carry NO password (the digest
 	// stays empty, so password login fails closed) and are never admin.
-	return provisionFederatedUser(ctx, db, app, prov, binding, id)
+	created, err := provisionFederatedUser(ctx, db, app, prov, binding, id)
+	return created, nil, err
+}
+
+// vouches reports whether an identity from a provider filed under org owner may
+// open account u. A platform provider (one filed under a reserved org) may open any
+// account outside a reserved org; any other provider only the accounts of the org
+// that owns it, and never a held org's. A provider's word is worth what its owner
+// already administers.
+func vouches(owner string, u *schema.User) bool {
+	if policy.IsReservedOrg(u.Owner) {
+		return false
+	}
+	return policy.IsReservedOrg(owner) || (u.Owner == owner && !policy.IsHeldOrg(owner))
+}
+
+// fedLink is a provider identity a sign-in links onto an existing account by the
+// address the provider verified. linkOrProvision resolves it and federationMint
+// writes it, so a sign-in that the account's state or its second factor refuses
+// writes nothing. It rides the second-factor challenge's payload, which the server
+// writes and the browser never sees.
+type fedLink struct {
+	Owner    string `json:"owner"`    // the provider record's org (providerOwner)
+	Type     string `json:"type"`     // the provider type, which names the connector column
+	Provider string `json:"provider"` // the provider record's name
+	Subject  string `json:"subject"`
+	Email    string `json:"email"` // the verified address, normalized
+}
+
+// write links l onto the account (owner, name) and audits it in the same
+// transaction (schema.ActionFederationLink). It re-reads the account under its row
+// lock and refuses (errAddressHeld) unless the account still holds the verified
+// address, the provider still vouches for it, and it holds no other subject of this
+// provider. The audit row is appended before the account is written, so a failed
+// audit writes no link, on a backend that commits each write on its own too.
+func (l *fedLink) write(ctx context.Context, db orm.DB, owner, name, client string) error {
+	binding, ok := connectorFor(l.Type)
+	if !ok {
+		return errors.New("federation: provider has no local identity binding")
+	}
+	_, err := updateUser(ctx, db, owner, name, func(tx orm.DB, fresh *schema.User) error {
+		held := *binding.ref(fresh)
+		if store.NormalizeEmail(fresh.Email) != l.Email || !vouches(l.Owner, fresh) || (held != "" && held != l.Subject) {
+			return errAddressHeld
+		}
+		object, _ := json.Marshal(map[string]any{
+			"provider": l.Provider, "subject": l.Subject, "client": client,
+			"emailVerified": fresh.EmailVerified,
+		})
+		*binding.ref(fresh) = l.Subject
+		fresh.EmailVerified = true
+		return store.Append(ctx, tx, &schema.AuditLog{
+			Owner:        fresh.Owner,
+			Organization: fresh.Owner,
+			User:         fresh.Owner + "/" + fresh.Name,
+			Action:       schema.ActionFederationLink,
+			Object:       string(object),
+			StatusCode:   http.StatusOK,
+		})
+	})
+	return err
 }
 
 // provisionFederatedUser creates a new federated account through the ONE

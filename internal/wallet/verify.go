@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -50,10 +51,15 @@ var (
 // The proof itself IS the SDK's own value — the seven attacker-controlled fields
 // are never re-declared here, so Go and TypeScript verify the identical value.
 type login struct {
-	// Domain is the brand host from the header-immune c.Host(), re-checked against
-	// the burned challenge. Never client-supplied (X-Forwarded-Host is ignored):
-	// the anti-phishing binding rides on it.
+	// Domain is what site() names for this request: the page's origin when the
+	// application registers it, else Host. Host is the header-immune c.Host() the
+	// request arrived on (X-Forwarded-Host is ignored). The burned challenge must
+	// name one of the two. Host stays acceptable beside a registered Origin
+	// because a browser sends no Origin on a same-origin GET, so a page that
+	// reaches IAM through its own host mints a Host-bound challenge and redeems it
+	// with a POST that does carry Origin.
 	Domain string
+	Host   string
 	Proof  wc.Proof
 	Method string // "signup" (default) | "login"
 
@@ -63,6 +69,11 @@ type login struct {
 	// Session is a caller who is already authenticated AND same-site — the one
 	// branch carrying ambient authority. nil when anonymous or cross-site.
 	Session *schema.User
+
+	// Client is who is asking (httpx.Client), and Cap the bound on the accounts
+	// it may create. Neither is read unless this proof would create one.
+	Client netip.Addr
+	Cap    Cap
 }
 
 // supported reports whether a chain family is one this build knows. Per-chain
@@ -89,7 +100,7 @@ func supported(chain wc.Chain) bool {
 //  2. BURN the nonce atomically, BEFORE any crypto, so a captured proof can
 //     never be replayed even when verification would succeed.
 //  3. Re-check the burned row's domain and chain: the nonce is pinned to the
-//     host it was minted against and the chain it was minted for.
+//     site it was minted for (site) and the chain it was minted for.
 //  4. VerifyProof — address binding, domain, nonce, time window, and the
 //     per-chain cryptographic check, all in the shared SDK.
 //  5. Resolve (chain, VERIFIED address) -> wallet -> user. Identity is the
@@ -115,8 +126,8 @@ func verify(ctx context.Context, db orm.DB, in login, now time.Time) (signin, er
 		return signin{}, err
 	}
 
-	// 3. The challenge pins the host and the chain.
-	if ch.Domain != in.Domain {
+	// 3. The challenge pins the site and the chain.
+	if ch.Domain != in.Domain && ch.Domain != in.Host {
 		return signin{}, errDomain
 	}
 	// Without this the chain label is decorative: a nonce minted for chain A
@@ -146,8 +157,8 @@ func verify(ctx context.Context, db orm.DB, in login, now time.Time) (signin, er
 
 // resolve turns a verified (chain, address) into the user it signs in as:
 // an existing link logs that user in; no link + a same-site session links the
-// wallet to that identity; no link + signup logs a fresh wallet user in. Only
-// the last two BIND, and only those report a bound wallet.
+// wallet to that identity; no link + signup logs a fresh wallet user in, as the
+// Cap allows. Only the last two BIND, and only those report a bound wallet.
 func resolve(ctx context.Context, db orm.DB, in login, address string, now time.Time) (signin, error) {
 	chain := string(in.Proof.Chain)
 
@@ -201,7 +212,15 @@ func resolve(ctx context.Context, db orm.DB, in login, address string, now time.
 				// cannot distinguish the two (no authority oracle).
 				return errNoSignup
 			default:
+				// A creation, so the Cap is asked first and the ledger row is
+				// written with the account: a refused one writes nothing.
+				if err := admit(ctx, tx, in.Cap, in.Client, now); err != nil {
+					return err
+				}
 				if user, err = provision(ctx, tx, in, address, now); err != nil {
+					return err
+				}
+				if err := file(ctx, tx, in, user); err != nil {
 					return err
 				}
 			}
